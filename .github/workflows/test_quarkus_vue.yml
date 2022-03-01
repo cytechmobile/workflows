@@ -1,0 +1,163 @@
+name: Test Web App with Quarkus and Vue
+
+on:
+  workflow_call:
+    inputs:
+      appid:
+        description: 'The APP ID. It is used to name the database to use for tests, along with the created user and password, and for gchat notifications'
+        type: string
+        required: true
+      dbuser:
+        description: 'The database user to create. If empty, it uses the appid'
+        type: string
+        required: false
+      dbpass:
+        description: 'The password of the database user. If empty, it uses the appid'
+        type: string
+        required: false
+      dbname:
+        description: 'The name of the database that will be created. If empty, it uses the appid'
+        type: string
+        required: false
+      java_version:
+        description: 'The JDK version to setup'
+        type: string
+        required: false
+        default: 17
+      java_distribution:
+        description: 'The JDK distribution to setup'
+        type: string
+        required: false
+        default: 'temurin'
+      node:
+        description: 'The node version to setup'
+        type: string
+        required: false
+        default: 'lts/*'
+      backend_dir:
+        description: 'The location of the backend code, relative to project root'
+        type: string
+        required: false
+        default: './backend'
+      ui_dir:
+        description: 'The location of the UI code, relative to project root'
+        type: string
+        required: false
+        default: './ui'
+      db_host_var:
+        description: 'The Environment variable to use for the database host'
+        type: string
+        required: false
+        default: 'DB_HOST'
+      setup_cypress_deps:
+        description: 'Whether to setup Cypress dependencies (assuming debian based os)'
+        type: string
+        required: false
+        default: true
+    secrets:
+      gchat:
+        description: 'Google Chat Webhook URL'
+        required: true
+
+# By setting up concurrency group using github.ref, we essentially instruct github to only run one workflow at a time per branch
+# With "cancel-in-progress: true" we also specify that existing/running workflows for that branch will be canceled
+concurrency:
+  group: TestQuarkusVueWebApp-${{github.ref}}
+  cancel-in-progress: true
+
+jobs:
+  TestQuarkusVueWebApp:
+    runs-on: [ self-hosted, linux ]
+    steps:
+      - name: checkout
+        uses: actions/checkout@v2
+      - name: Setup Java
+        uses: actions/setup-java@v2
+        with:
+          java-version: ${{ inputs.java_version }}
+          distribution: ${{ inputs.java_distribution }}
+      - name: Setup Node
+        uses: actions/setup-node@v2
+        with:
+          node-version: ${{ inputs.node }}
+      - name: Update NPM
+        run: npm i -g npm
+      - name: build-backend
+        working-directory: ${{ inputs.backend_dir }}
+        run: ./mvnw verify
+      - name: build-frontend
+        working-directory: ${{ inputs.ui_dir }}
+        run: npm install && npm run lint
+      - name: Start Test DB
+        # start a db, find its id and ip and set them to the github env, to make them available to next steps
+        run: |
+          APPID="${{ inputs.appid }}"
+          DB_USER="${{inputs.dbuser}}"
+          DB_USER="${DB_USER:-${APPID}}"
+          DB_PASS="${{inputs.dbpass}}"
+          DB_PASS="${DB_PASS:-${APPID}}"
+          DB_NAME="${{inputs.dbname}}"
+          DB_NAME="${DB_NAME:-${APPID}}"
+          DBID=$(docker run -d -e POSTGRES_USER=$DB_USER -e POSTGRES_PASSWORD=$DB_PASS -e POSTGRES_DB=$DB_NAME --tmpfs /var/lib/postgresql/data:rw postgres:alpine -c fsync=off -c synchronous_commit=off -c full_page_writes=off)
+          echo "started db: ${DBID}"
+          echo "DBID=$DBID" >> $GITHUB_ENV
+          DBIP=$(docker inspect -f {{.NetworkSettings.IPAddress}} ${DBID})
+          echo "found db ip: ${DBIP}"
+          echo "DBIP=${DBIP}" >> $GITHUB_ENV
+          HOST_ENV_VAR="${{ inputs.db_host_var }}"
+          echo "${HOST_ENV_VAR}=${DBIP}" >> $GITHUB_ENV
+      - name: prepare-backend
+        id: prepare_backend
+        working-directory: ${{ inputs.backend_dir }}
+        run: |
+          # the db is started in the previous step and the env var to find its name has been already set, so we can use it here
+          ./mvnw quarkus:dev > ./app.log &
+      - name: Prepare UI Tests
+        shell: bash
+        if: success() && ${{ inputs.prepare_ui }} == "true"
+        run: |
+          apt-get update
+          # dependencies required by cypress: https://docs.cypress.io/guides/continuous-integration/introduction#Dependencies
+          apt-get install -y libgtk2.0-0 libgtk-3-0 libgbm-dev libnotify-dev libgconf-2-4 libnss3 libxss1 libasound2 libxtst6 xauth xvfb
+      - name: test-ui
+        working-directory: ${{ inputs.ui_dir }}
+        run: npm run test:e2e
+      - name: show-backend-logs
+        working-directory: ${{ inputs.backend_dir }}
+        run: cat ./app.log
+        if: failure() && steps.build.outputs.prepare_backend.exit_code == 0
+      # upload cypress screenshots
+      - name: Upload Screenshots
+        uses: actions/upload-artifact@v2
+        if: failure() && steps.build.outputs.prepare_backend.exit_code == 0
+        with:
+          name: cypress-screenshots
+          path: ${{inputs.ui_dir}}/tests/e2e/screenshots
+      # upload cypress videos
+      # Test run video was always captured, so this action uses "always()" condition
+      - name: Upload Videos
+        uses: actions/upload-artifact@v2
+        if: failure() && steps.build.outputs.prepare_backend.exit_code == 0
+        with:
+          name: cypress-videos
+          path: ${{inputs.ui_dir}}/tests/e2e/videos
+      - name: Stop Test DB
+        if: always()
+        run: docker rm -f "${DBID}"
+      - name: AutoMerge Dependabot PRs
+        if: success() && github.actor == 'dependabot[bot]' && github.ref != 'refs/heads/main'
+        env:
+          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+        run: |
+          echo "found successful dependabot PR, merging it"
+          gh pr merge --auto --merge
+      - name: Google Chat Notification
+        uses: Co-qn/google-chat-notification@releases/v1
+        with:
+          name: Build ${{ inputs.appid }}
+          url: ${{ secrets.gchat }}
+          status: ${{ job.status }}
+        if: always()
+        # this allows the build to succeed even when the notification fails (e.g. due to dependabot push, which does not have the secret)
+        continue-on-error: true
+
