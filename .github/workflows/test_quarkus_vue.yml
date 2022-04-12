@@ -150,7 +150,7 @@ jobs:
           GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
         run: |
           echo "found successful dependabot PR, merging it"
-          gh pr merge --auto --merge
+          gh pr merge --merge
       - name: Google Chat Notification
         uses: Co-qn/google-chat-notification@releases/v1
         with:
